@@ -1,13 +1,12 @@
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const axios = require("axios");
 
-const PROFILE_SHARE_ID = "p.k7ky5tvxj7vurvtblpjto6ck2a";
-const USER_ID = "ur113060684";
-const WATCHLIST_URL = `https://www.imdb.com/user/${PROFILE_SHARE_ID}/watchlist/`;
+const SHARE_ID = "p.k7ky5tvxj7vurvtblpjto6ck2a";
+const EXPORT_URL = `https://www.imdb.com/user/${SHARE_ID}/watchlist/export`;
 
 const manifest = {
     id: "org.swiftd89.imdbwatchlist",
-    version: "1.4.0",
+    version: "1.5.0",
     name: "IMDb Watchlist 🎬",
     description: "Live sync of IMDb Watchlist",
     resources: ["catalog"],
@@ -28,74 +27,26 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-let cache = {
-    timestamp: 0,
-    movies: [],
-    series: []
-};
+let cache = { timestamp: 0, movies: [], series: [] };
 const CACHE_TTL = 5 * 60 * 1000;
 
-async function fetchViaGraphQL(targetUserId) {
-    const query = `
-    query WatchlistQuery($userId: ID!) {
-      userProfile(input: { userId: $userId }) {
-        userId
-      }
-      predefinedList(classType: WATCH_LIST, userId: $userId) {
-        items(first: 250) {
-          edges {
-            node {
-              item {
-                ... on Title {
-                  id
-                  titleText { text }
-                  titleType { id }
-                  releaseYear { year }
-                }
-              }
-            }
-          }
+function parseCsvLine(line) {
+    const result = [];
+    let current = "";
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '"') {
+            inQuotes = !inQuotes;
+        } else if (ch === "," && !inQuotes) {
+            result.push(current.trim());
+            current = "";
+        } else {
+            current += ch;
         }
-      }
-    }`;
-
-    const res = await axios.post(
-        "https://caching.graphql.imdb.com/",
-        {
-            query,
-            variables: { userId: targetUserId }
-        },
-        {
-            headers: {
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                "x-imdb-client-name": "imdb-web-next"
-            },
-            timeout: 10000,
-            validateStatus: () => true
-        }
-    );
-
-    if (res.status !== 200 || res.data?.errors) {
-        console.error(`[GraphQL Debug (${targetUserId})]: Status ${res.status} - ${JSON.stringify(res.data?.errors || res.data).slice(0, 300)}`);
-        return [];
     }
-
-    const edges = res.data?.data?.predefinedList?.items?.edges || [];
-    const items = [];
-
-    for (const edge of edges) {
-        const titleNode = edge?.node?.item;
-        if (!titleNode?.id) continue;
-        items.push({
-            id: titleNode.id,
-            name: titleNode.titleText?.text || titleNode.id,
-            typeId: (titleNode.titleType?.id || "").toLowerCase(),
-            year: titleNode.releaseYear?.year
-        });
-    }
-
-    return items;
+    result.push(current.trim());
+    return result;
 }
 
 async function fetchWatchlist() {
@@ -105,39 +56,64 @@ async function fetchWatchlist() {
     }
 
     try {
-        console.log(`[IMDb Sync] Querying GraphQL...`);
-        let items = await fetchViaGraphQL(USER_ID);
+        console.log(`[IMDb Sync] Fetching CSV from ${EXPORT_URL}...`);
+        const res = await axios.get(EXPORT_URL, {
+            headers: {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/csv,text/plain,*/*"
+            },
+            timeout: 12000,
+            validateStatus: () => true
+        });
 
-        if (items.length === 0) {
-            items = await fetchViaGraphQL(PROFILE_SHARE_ID);
+        const body = String(res.data || "");
+        console.log(`[IMDb Sync] Status: ${res.status}, Length: ${body.length}, Preview: ${body.slice(0, 120).replace(/\n/g, " ")}`);
+
+        const lines = body.split(/\r?\n/).filter(Boolean);
+        if (lines.length < 2) {
+            return cache;
         }
+
+        const headers = parseCsvLine(lines[0]).map(h => h.toLowerCase());
+        const constIdx = headers.indexOf("const");
+        const titleIdx = headers.indexOf("title");
+        const typeIdx = headers.indexOf("title type");
+        const yearIdx = headers.indexOf("year");
 
         const movies = [];
         const series = [];
 
-        for (const item of items) {
-            const isSeries =
-                item.typeId.includes("series") ||
-                item.typeId.includes("mini") ||
-                item.typeId.includes("tv");
+        for (let i = 1; i < lines.length; i++) {
+            const cols = parseCsvLine(lines[i]);
+            const imdbId = cols[constIdx];
+            if (!imdbId || !imdbId.startsWith("tt")) continue;
 
-            const metaPreview = {
-                id: item.id,
+            const title = cols[titleIdx] || imdbId;
+            const titleType = (cols[typeIdx] || "").toLowerCase();
+            const year = cols[yearIdx] || undefined;
+
+            const isSeries =
+                titleType.includes("series") ||
+                titleType.includes("mini") ||
+                titleType.includes("tv");
+
+            const meta = {
+                id: imdbId,
                 type: isSeries ? "series" : "movie",
-                name: item.name,
-                releaseInfo: item.year ? String(item.year) : undefined,
-                poster: `https://images.metahub.space/poster/medium/${item.id}/img`,
+                name: title,
+                releaseInfo: year,
+                poster: `https://images.metahub.space/poster/medium/${imdbId}/img`,
                 posterShape: "poster"
             };
 
             if (isSeries) {
-                series.push(metaPreview);
+                series.push(meta);
             } else {
-                movies.push(metaPreview);
+                movies.push(meta);
             }
         }
 
-        console.log(`[IMDb Sync] Final parsed: ${movies.length} movies and ${series.length} series.`);
+        console.log(`[IMDb Sync] Parsed ${movies.length} movies and ${series.length} series.`);
         if (movies.length > 0 || series.length > 0) {
             cache = { timestamp: now, movies, series };
         }
@@ -151,14 +127,8 @@ async function fetchWatchlist() {
 builder.defineCatalogHandler(async ({ type, id }) => {
     console.log(`[Catalog Request] Type: ${type}, ID: ${id}`);
     const data = await fetchWatchlist();
-
-    if (type === "movie" && id === "imdb_watchlist_movies") {
-        return { metas: data.movies };
-    }
-    if (type === "series" && id === "imdb_watchlist_series") {
-        return { metas: data.series };
-    }
-
+    if (type === "movie" && id === "imdb_watchlist_movies") return { metas: data.movies };
+    if (type === "series" && id === "imdb_watchlist_series") return { metas: data.series };
     return { metas: [] };
 });
 
