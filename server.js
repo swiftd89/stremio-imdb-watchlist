@@ -33,7 +33,6 @@ let cache = {
 };
 const CACHE_TTL = 10 * 60 * 1000;
 
-// Recursively search IMDb's __NEXT_DATA__ JSON for title items
 function extractTitlesFromJson(obj, results = new Map()) {
     if (!obj || typeof obj !== "object") return results;
 
@@ -93,7 +92,6 @@ async function fetchWatchlist() {
         const movies = [];
         const series = [];
 
-        // Extract __NEXT_DATA__ JSON block
         const nextDataMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
 
         if (nextDataMatch && nextDataMatch[1]) {
@@ -110,7 +108,7 @@ async function fetchWatchlist() {
                     id: item.id,
                     type: isSeries ? "series" : "movie",
                     name: item.name,
-                    releaseInfo: item.year ? String(item.year) : undefined,
+                    releaseInfo: year ? String(item.year) : undefined,
                     poster: `https://images.metahub.space/poster/medium/${item.id}/img`,
                     posterShape: "poster"
                 };
@@ -122,7 +120,6 @@ async function fetchWatchlist() {
                 }
             }
         } else {
-            // Fallback: scan raw HTML for unique tt IDs if __NEXT_DATA__ is absent
             const idMatches = [...new Set(html.match(/tt\d{7,9}/g) || [])];
             for (const imdbId of idMatches) {
                 movies.push({
