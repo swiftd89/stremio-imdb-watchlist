@@ -1,11 +1,12 @@
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const axios = require("axios");
 
-const WATCHLIST_URL = "https://www.imdb.com/user/p.k7ky5tvxj7vurvtblpjto6ck2a/watchlist/";
+const PROFILE_ID = "p.k7ky5tvxj7vurvtblpjto6ck2a";
+const WATCHLIST_URL = `https://www.imdb.com/user/${PROFILE_ID}/watchlist/`;
 
 const manifest = {
     id: "org.swiftd89.imdbwatchlist",
-    version: "1.2.0",
+    version: "1.3.0",
     name: "IMDb Watchlist 🎬",
     description: "Live sync of IMDb Watchlist",
     resources: ["catalog"],
@@ -71,6 +72,71 @@ function extractTitlesFromJson(obj, results = new Map()) {
     return results;
 }
 
+// Primary: IMDb GraphQL API (bypasses frontend AWS WAF HTML challenge)
+async function fetchViaGraphQL() {
+    const query = `
+    query WatchlistQuery($userId: ID!) {
+      user(id: $userId) {
+        watchlist(first: 250) {
+          edges {
+            node {
+              id
+              titleText { text }
+              titleType { id }
+              releaseYear { year }
+            }
+          }
+        }
+      }
+    }`;
+
+    const res = await axios.post(
+        "https://caching.graphql.imdb.com/",
+        {
+            query,
+            variables: { userId: PROFILE_ID }
+        },
+        {
+            headers: {
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                "x-imdb-client-name": "imdb-web-next"
+            },
+            timeout: 10000
+        }
+    );
+
+    const edges = res.data?.data?.user?.watchlist?.edges || [];
+    const items = [];
+
+    for (const edge of edges) {
+        const node = edge?.node;
+        if (!node?.id) continue;
+        items.push({
+            id: node.id,
+            name: node.titleText?.text || node.id,
+            typeId: (node.titleType?.id || "").toLowerCase(),
+            year: node.releaseYear?.year
+        });
+    }
+
+    return items;
+}
+
+// Fallback: Residential Proxy Bridge if direct HTML is WAF-challenged
+async function fetchViaFallbackProxy() {
+    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(WATCHLIST_URL)}`;
+    const res = await axios.get(proxyUrl, { timeout: 15000 });
+    const html = String(res.data);
+
+    const nextDataMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+    if (nextDataMatch && nextDataMatch[1]) {
+        const jsonData = JSON.parse(nextDataMatch[1]);
+        return Array.from(extractTitlesFromJson(jsonData).values());
+    }
+    return [];
+}
+
 async function fetchWatchlist() {
     const now = Date.now();
     if (now - cache.timestamp < CACHE_TTL && (cache.movies.length > 0 || cache.series.length > 0)) {
@@ -78,64 +144,48 @@ async function fetchWatchlist() {
     }
 
     try {
-        console.log(`[IMDb Sync] Fetching watchlist HTML from ${WATCHLIST_URL}...`);
-        const response = await axios.get(WATCHLIST_URL, {
-            headers: {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9"
-            },
-            timeout: 12000,
-            validateStatus: () => true
-        });
+        console.log(`[IMDb Sync] Querying GraphQL for ${PROFILE_ID}...`);
+        let items = [];
 
-        console.log(`[IMDb Sync] HTTP Status: ${response.status}, Length: ${String(response.data).length}`);
-        const html = String(response.data);
+        try {
+            items = await fetchViaGraphQL();
+            console.log(`[IMDb Sync] GraphQL returned ${items.length} items.`);
+        } catch (gqlErr) {
+            console.error(`[IMDb GraphQL Error]: ${gqlErr.message}`);
+        }
+
+        if (items.length === 0) {
+            console.log(`[IMDb Sync] Trying fallback proxy fetch...`);
+            items = await fetchViaFallbackProxy();
+            console.log(`[IMDb Sync] Fallback proxy returned ${items.length} items.`);
+        }
+
         const movies = [];
         const series = [];
 
-        const nextDataMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+        for (const item of items) {
+            const isSeries =
+                item.typeId.includes("series") ||
+                item.typeId.includes("mini") ||
+                item.typeId.includes("tv");
 
-        if (nextDataMatch && nextDataMatch[1]) {
-            const jsonData = JSON.parse(nextDataMatch[1]);
-            const extractedMap = extractTitlesFromJson(jsonData);
+            const metaPreview = {
+                id: item.id,
+                type: isSeries ? "series" : "movie",
+                name: item.name,
+                releaseInfo: item.year ? String(item.year) : undefined,
+                poster: `https://images.metahub.space/poster/medium/${item.id}/img`,
+                posterShape: "poster"
+            };
 
-            for (const item of extractedMap.values()) {
-                const isSeries =
-                    item.typeId.includes("series") ||
-                    item.typeId.includes("mini") ||
-                    item.typeId.includes("tv");
-
-                const metaPreview = {
-                    id: item.id,
-                    type: isSeries ? "series" : "movie",
-                    name: item.name,
-                    releaseInfo: item.year ? String(item.year) : undefined,
-                    poster: `https://images.metahub.space/poster/medium/${item.id}/img`,
-                    posterShape: "poster"
-                };
-
-                if (isSeries) {
-                    series.push(metaPreview);
-                } else {
-                    movies.push(metaPreview);
-                }
-            }
-        } else {
-            console.log("[IMDb Sync] __NEXT_DATA__ not found, scanning raw HTML for tt IDs...");
-            const idMatches = [...new Set(html.match(/tt\d{7,9}/g) || [])];
-            for (const imdbId of idMatches) {
-                movies.push({
-                    id: imdbId,
-                    type: "movie",
-                    name: imdbId,
-                    poster: `https://images.metahub.space/poster/medium/${imdbId}/img`,
-                    posterShape: "poster"
-                });
+            if (isSeries) {
+                series.push(metaPreview);
+            } else {
+                movies.push(metaPreview);
             }
         }
 
-        console.log(`[IMDb Sync] Parsed ${movies.length} movies and ${series.length} series.`);
+        console.log(`[IMDb Sync] Final parsed: ${movies.length} movies and ${series.length} series.`);
         if (movies.length > 0 || series.length > 0) {
             cache = { timestamp: now, movies, series };
         }
