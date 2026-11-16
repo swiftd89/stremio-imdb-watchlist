@@ -1,12 +1,13 @@
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const axios = require("axios");
 
-const PROFILE_ID = "p.k7ky5tvxj7vurvtblpjto6ck2a";
-const WATCHLIST_URL = `https://www.imdb.com/user/${PROFILE_ID}/watchlist/`;
+const PROFILE_SHARE_ID = "p.k7ky5tvxj7vurvtblpjto6ck2a";
+const USER_ID = "ur113060684";
+const WATCHLIST_URL = `https://www.imdb.com/user/${PROFILE_SHARE_ID}/watchlist/`;
 
 const manifest = {
     id: "org.swiftd89.imdbwatchlist",
-    version: "1.3.0",
+    version: "1.4.0",
     name: "IMDb Watchlist 🎬",
     description: "Live sync of IMDb Watchlist",
     resources: ["catalog"],
@@ -34,56 +35,24 @@ let cache = {
 };
 const CACHE_TTL = 5 * 60 * 1000;
 
-function extractTitlesFromJson(obj, results = new Map()) {
-    if (!obj || typeof obj !== "object") return results;
-
-    if (obj.id && typeof obj.id === "string" && /^tt\d{6,10}$/.test(obj.id)) {
-        const titleText =
-            obj.titleText?.text ||
-            obj.originalTitleText?.text ||
-            obj.name ||
-            obj.id;
-
-        const typeId = (
-            obj.titleType?.id ||
-            obj.titleType?.text ||
-            ""
-        ).toLowerCase();
-
-        const releaseYear = obj.releaseYear?.year || undefined;
-
-        if (!results.has(obj.id) || (titleText !== obj.id && results.get(obj.id).name === obj.id)) {
-            results.set(obj.id, {
-                id: obj.id,
-                name: titleText,
-                typeId,
-                year: releaseYear
-            });
-        }
-    }
-
-    if (Array.isArray(obj)) {
-        for (const item of obj) extractTitlesFromJson(item, results);
-    } else {
-        for (const key of Object.keys(obj)) {
-            extractTitlesFromJson(obj[key], results);
-        }
-    }
-    return results;
-}
-
-// Primary: IMDb GraphQL API (bypasses frontend AWS WAF HTML challenge)
-async function fetchViaGraphQL() {
+async function fetchViaGraphQL(targetUserId) {
     const query = `
     query WatchlistQuery($userId: ID!) {
-      user(id: $userId) {
-        watchlist(first: 250) {
+      userProfile(input: { userId: $userId }) {
+        userId
+      }
+      predefinedList(classType: WATCH_LIST, userId: $userId) {
+        items(first: 250) {
           edges {
             node {
-              id
-              titleText { text }
-              titleType { id }
-              releaseYear { year }
+              item {
+                ... on Title {
+                  id
+                  titleText { text }
+                  titleType { id }
+                  releaseYear { year }
+                }
+              }
             }
           }
         }
@@ -94,7 +63,7 @@ async function fetchViaGraphQL() {
         "https://caching.graphql.imdb.com/",
         {
             query,
-            variables: { userId: PROFILE_ID }
+            variables: { userId: targetUserId }
         },
         {
             headers: {
@@ -102,39 +71,31 @@ async function fetchViaGraphQL() {
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
                 "x-imdb-client-name": "imdb-web-next"
             },
-            timeout: 10000
+            timeout: 10000,
+            validateStatus: () => true
         }
     );
 
-    const edges = res.data?.data?.user?.watchlist?.edges || [];
+    if (res.status !== 200 || res.data?.errors) {
+        console.error(`[GraphQL Debug (${targetUserId})]: Status ${res.status} - ${JSON.stringify(res.data?.errors || res.data).slice(0, 300)}`);
+        return [];
+    }
+
+    const edges = res.data?.data?.predefinedList?.items?.edges || [];
     const items = [];
 
     for (const edge of edges) {
-        const node = edge?.node;
-        if (!node?.id) continue;
+        const titleNode = edge?.node?.item;
+        if (!titleNode?.id) continue;
         items.push({
-            id: node.id,
-            name: node.titleText?.text || node.id,
-            typeId: (node.titleType?.id || "").toLowerCase(),
-            year: node.releaseYear?.year
+            id: titleNode.id,
+            name: titleNode.titleText?.text || titleNode.id,
+            typeId: (titleNode.titleType?.id || "").toLowerCase(),
+            year: titleNode.releaseYear?.year
         });
     }
 
     return items;
-}
-
-// Fallback: Residential Proxy Bridge if direct HTML is WAF-challenged
-async function fetchViaFallbackProxy() {
-    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(WATCHLIST_URL)}`;
-    const res = await axios.get(proxyUrl, { timeout: 15000 });
-    const html = String(res.data);
-
-    const nextDataMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
-    if (nextDataMatch && nextDataMatch[1]) {
-        const jsonData = JSON.parse(nextDataMatch[1]);
-        return Array.from(extractTitlesFromJson(jsonData).values());
-    }
-    return [];
 }
 
 async function fetchWatchlist() {
@@ -144,20 +105,11 @@ async function fetchWatchlist() {
     }
 
     try {
-        console.log(`[IMDb Sync] Querying GraphQL for ${PROFILE_ID}...`);
-        let items = [];
-
-        try {
-            items = await fetchViaGraphQL();
-            console.log(`[IMDb Sync] GraphQL returned ${items.length} items.`);
-        } catch (gqlErr) {
-            console.error(`[IMDb GraphQL Error]: ${gqlErr.message}`);
-        }
+        console.log(`[IMDb Sync] Querying GraphQL...`);
+        let items = await fetchViaGraphQL(USER_ID);
 
         if (items.length === 0) {
-            console.log(`[IMDb Sync] Trying fallback proxy fetch...`);
-            items = await fetchViaFallbackProxy();
-            console.log(`[IMDb Sync] Fallback proxy returned ${items.length} items.`);
+            items = await fetchViaGraphQL(PROFILE_SHARE_ID);
         }
 
         const movies = [];
