@@ -5,7 +5,7 @@ const WATCHLIST_URL = "https://www.imdb.com/user/p.k7ky5tvxj7vurvtblpjto6ck2a/wa
 
 const manifest = {
     id: "org.swiftd89.imdbwatchlist",
-    version: "1.1.0",
+    version: "1.2.0",
     name: "IMDb Watchlist 🎬",
     description: "Live sync of IMDb Watchlist",
     resources: ["catalog"],
@@ -31,7 +31,7 @@ let cache = {
     movies: [],
     series: []
 };
-const CACHE_TTL = 10 * 60 * 1000;
+const CACHE_TTL = 5 * 60 * 1000;
 
 function extractTitlesFromJson(obj, results = new Map()) {
     if (!obj || typeof obj !== "object") return results;
@@ -49,14 +49,14 @@ function extractTitlesFromJson(obj, results = new Map()) {
             ""
         ).toLowerCase();
 
-        const year = obj.releaseYear?.year || undefined;
+        const releaseYear = obj.releaseYear?.year || undefined;
 
         if (!results.has(obj.id) || (titleText !== obj.id && results.get(obj.id).name === obj.id)) {
             results.set(obj.id, {
                 id: obj.id,
                 name: titleText,
                 typeId,
-                year
+                year: releaseYear
             });
         }
     }
@@ -85,10 +85,12 @@ async function fetchWatchlist() {
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9"
             },
-            timeout: 12000
+            timeout: 12000,
+            validateStatus: () => true
         });
 
-        const html = response.data;
+        console.log(`[IMDb Sync] HTTP Status: ${response.status}, Length: ${String(response.data).length}`);
+        const html = String(response.data);
         const movies = [];
         const series = [];
 
@@ -108,7 +110,7 @@ async function fetchWatchlist() {
                     id: item.id,
                     type: isSeries ? "series" : "movie",
                     name: item.name,
-                    releaseInfo: year ? String(item.year) : undefined,
+                    releaseInfo: item.year ? String(item.year) : undefined,
                     poster: `https://images.metahub.space/poster/medium/${item.id}/img`,
                     posterShape: "poster"
                 };
@@ -120,6 +122,7 @@ async function fetchWatchlist() {
                 }
             }
         } else {
+            console.log("[IMDb Sync] __NEXT_DATA__ not found, scanning raw HTML for tt IDs...");
             const idMatches = [...new Set(html.match(/tt\d{7,9}/g) || [])];
             for (const imdbId of idMatches) {
                 movies.push({
